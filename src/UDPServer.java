@@ -9,7 +9,7 @@ public class UDPServer {
     private static DatagramSocket wifiSocket;
     public static void main(String[] args) {
         try {
-            wifiSocket = new DatagramSocket(18885);
+            wifiSocket = new DatagramSocket(19000);
             new Thread(new Runnable() {
                 @Override
                 public void run() {
