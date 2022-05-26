@@ -12,7 +12,7 @@ class LTETCPServer{
             try {
                 DataInputStream in = new DataInputStream(socket
                         .getInputStream());// 读取客户端传过来信息的DataInputStream
-                File file = new File("/home/test.mkv");
+                File file = new File("/home/test.mp4");
                 FileOutputStream os = null;
                 try {
                     os = new FileOutputStream(file);
@@ -47,7 +47,7 @@ class WIFITCPServer{
             try {
                 DataInputStream in = new DataInputStream(socket
                         .getInputStream());// 读取客户端传过来信息的DataInputStream
-                File file = new File("/home/test.mkv");
+                File file = new File("/home/test.mp4");
                 FileOutputStream os = null;
                 try {
                     os = new FileOutputStream(file);
@@ -111,7 +111,7 @@ public class TCPServer {//ChatServer类
                         int len = data.length;
                         DatagramPacket packet = new DatagramPacket(data,len,address,dstport);
                         speedSocket.send(packet);
-                        System.out.println(lteBW);
+                       // System.out.println(lteBW);
                         TimeUnit.SECONDS.sleep(1);
                     }
                 }

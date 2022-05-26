@@ -1,27 +1,26 @@
-
-import javafx.scene.control.TableRow;
-
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.net.*;
 import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
-import java.security.cert.TrustAnchor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 enum PacketType{
     DATAPKG((byte)0),   //数据包
     PROBEPKG((byte)1),  //探测包
     ACKPKG((byte)2),    //ACK报文
     NAKPKG((byte)3),   //NAK报文
-    RETRANS((byte)4),
-    FIN((byte)5),
-    PTO((byte)6);
+    RETRANS((byte)4),   //重传包
+    FIN((byte)5),       //结束报文
+    OPD((byte)6),       //data for other path
+    OPDACK((byte)7),    //对OPD的ACK
+    OPDTASK((byte)8);
+
     public byte t;
 
     PacketType(byte t) {
@@ -69,7 +68,11 @@ class SplbHdr{
             case (byte)5:
                 this.type = PacketType.FIN;break;
             case (byte)6:
-                this.type = PacketType.PTO;break;
+                this.type = PacketType.OPD;break;
+            case (byte)7:
+                this.type = PacketType.OPDACK;break;
+            case (byte)8:
+                this.type = PacketType.OPDTASK;break;
         }
         this.pathNum = byteBuffer.get();
 
@@ -104,15 +107,15 @@ class SplbData implements Comparable<SplbData>{
 
 
 class LTEControlBlock {
-    public DatagramSocket socket = null;
+    public ServerSock serverSock;
+    public DatagramSocket socket;
     InetAddress dstIP = null;
     public int dstPort = 0;
     public int recvBytes = 0;
     public int nowRecv = 0;
-    public long nowTime = 0;
-    public int sgap = 0;
+    public int gap = 0;
     public boolean endSign = false;
-    public int wantedSeq = 1;
+    public AtomicInteger wantedSeq = new AtomicInteger(1);
     public int arrInOrderCounter = 0;
     public int ackThres = 3;
     public long startTime = 0;
@@ -120,13 +123,22 @@ class LTEControlBlock {
     public long recvCounterTS = 0;
     public PriorityBlockingQueue<SplbData> inorderQueue;
     public PriorityBlockingQueue<SplbData> outorderQueue;
-    public ExecutorService lteProbeExecutor = null;
-    public ExecutorService lteDataExecutor = null;
-    public ExecutorService lteAckExecutor = null;
+    public ExecutorService lteProbeExecutor;
+    public ExecutorService lteDataExecutor;
+    public ExecutorService lteAckExecutor;
     LTEControlBlock(DatagramSocket socket){
         this.socket = socket;
-        this.inorderQueue = new PriorityBlockingQueue<SplbData>();
-        this.outorderQueue = new PriorityBlockingQueue<SplbData>();
+        this.inorderQueue = new PriorityBlockingQueue<>();
+        this.outorderQueue = new PriorityBlockingQueue<>();
+        this.lteProbeExecutor = Executors.newSingleThreadExecutor();
+        this.lteDataExecutor = Executors.newSingleThreadExecutor();
+        this.lteAckExecutor = Executors.newSingleThreadExecutor();
+    }
+    LTEControlBlock(DatagramSocket socket,ServerSock serverSock){
+        this.socket = socket;
+        this.serverSock = serverSock;
+        this.inorderQueue = new PriorityBlockingQueue<>();
+        this.outorderQueue = new PriorityBlockingQueue<>();
         this.lteProbeExecutor = Executors.newSingleThreadExecutor();
         this.lteDataExecutor = Executors.newSingleThreadExecutor();
         this.lteAckExecutor = Executors.newSingleThreadExecutor();
@@ -134,7 +146,7 @@ class LTEControlBlock {
 }
 class LTEProbeTask implements Runnable{
 
-    LTEControlBlock lteControlBlock = null;
+    LTEControlBlock lteControlBlock;
     SplbHdr hdr;
     LTEProbeTask(LTEControlBlock lteControlBlock,SplbHdr hdr){
         this.lteControlBlock = lteControlBlock;
@@ -143,7 +155,7 @@ class LTEProbeTask implements Runnable{
     @Override
     public void run() {
         try {
-            hdr.dataSeq = lteControlBlock.sgap;
+            hdr.dataSeq = lteControlBlock.gap;
             byte[] probe = hdr.toByteArray();
             DatagramPacket packet = new DatagramPacket(probe,probe.length,lteControlBlock.dstIP,lteControlBlock.dstPort);
             lteControlBlock.socket.send(packet);
@@ -153,9 +165,9 @@ class LTEProbeTask implements Runnable{
     }
 }
 class LTEACKTask implements Runnable{
-    LTEControlBlock lteControlBlock = null;
-    int ackSeq = 0;
-    int wantedSeq = 0;
+    LTEControlBlock lteControlBlock;
+    int ackSeq;
+    int wantedSeq;
     PacketType type;
     long timeStamp;
     LTEACKTask(LTEControlBlock lteControlBlock,int ackSeq,int wantedSeq,PacketType type,long timeStamp){
@@ -170,9 +182,11 @@ class LTEACKTask implements Runnable{
     public void run() {
         SplbHdr ackHdr;
         if(this.type == PacketType.ACKPKG){
-            ackHdr = new SplbHdr(PacketType.ACKPKG, (byte) 1, 0, this.ackSeq, this.wantedSeq);
+            ackHdr = new SplbHdr(PacketType.ACKPKG, (byte) 0, 0, this.ackSeq, this.wantedSeq);
+        }else if(this.type == PacketType.NAKPKG){
+            ackHdr = new SplbHdr(PacketType.NAKPKG, (byte) 0, 0, this.ackSeq,this.wantedSeq);
         }else{
-            ackHdr = new SplbHdr(PacketType.NAKPKG, (byte) 1, 0, this.ackSeq,this.wantedSeq);
+            ackHdr = new SplbHdr(PacketType.OPDACK, (byte) 1, 0, this.ackSeq, this.wantedSeq);
         }
         ackHdr.timeStamp = timeStamp;
         byte[] ackMsg = ackHdr.toByteArray();
@@ -186,8 +200,8 @@ class LTEACKTask implements Runnable{
 }
 class LTEDataTask implements Runnable{
 
-    LTEControlBlock lteControlBlock = null;
-    SplbHdr hdr = null;
+    LTEControlBlock lteControlBlock;
+    SplbHdr hdr;
     byte[] msg;
     int len;
     LTEDataTask(LTEControlBlock lteControlBlock,SplbHdr hdr,byte[] msg,int len){
@@ -198,26 +212,28 @@ class LTEDataTask implements Runnable{
     }
     @Override
     public void run() {
-        lteControlBlock.recvBytes += msg.length;
+        if(hdr.type != PacketType.FIN && hdr.type != PacketType.OPDTASK){
+            lteControlBlock.recvBytes += msg.length;
+        }
+
         if(hdr.type == PacketType.DATAPKG){
-            if(hdr.pathSeq == lteControlBlock.wantedSeq){   //按序到达的数据包
+            int wantedSeq = lteControlBlock.wantedSeq.get();
+            if(hdr.pathSeq == wantedSeq){   //按序到达的数据包
                 lteControlBlock.inorderQueue.put(new SplbData(hdr,msg,len));
                 lteControlBlock.arrInOrderCounter++;
-                lteControlBlock.wantedSeq++;
+                wantedSeq = lteControlBlock.wantedSeq.incrementAndGet();
                 if(lteControlBlock.arrInOrderCounter == lteControlBlock.ackThres){
                     lteControlBlock.arrInOrderCounter = 0;
-                    //  System.out.println("ack:"+hdr.pathSeq + "," + lteControlBlock.wantedSeq);
-                    LTEACKTask ackTask = new LTEACKTask(lteControlBlock,hdr.pathSeq,lteControlBlock.wantedSeq,PacketType.ACKPKG,hdr.timeStamp);
+                    LTEACKTask ackTask = new LTEACKTask(lteControlBlock,hdr.pathSeq,wantedSeq,PacketType.ACKPKG,hdr.timeStamp);
                     lteControlBlock.lteAckExecutor.execute(ackTask);
                 }
-
                 while(lteControlBlock.outorderQueue.size() > 0){
-                    if(lteControlBlock.outorderQueue.peek().hdr.pathSeq < lteControlBlock.wantedSeq){  //检查是否可以从无序队列迁移出来
+                    if(lteControlBlock.outorderQueue.peek().hdr.pathSeq < wantedSeq){  //检查是否可以从无序队列迁移出来
                         lteControlBlock.outorderQueue.poll();
-                    } else if(lteControlBlock.outorderQueue.peek().hdr.pathSeq == lteControlBlock.wantedSeq){
+                    } else if(lteControlBlock.outorderQueue.peek().hdr.pathSeq == wantedSeq){
                         SplbData fData = lteControlBlock.outorderQueue.poll();
-                        if(fData.hdr.pathSeq == lteControlBlock.wantedSeq){
-                            lteControlBlock.wantedSeq++;
+                        if(fData.hdr.pathSeq == wantedSeq){
+                            wantedSeq = lteControlBlock.wantedSeq.incrementAndGet();
                             lteControlBlock.inorderQueue.put(fData);
                         }
                     }else{
@@ -225,47 +241,78 @@ class LTEDataTask implements Runnable{
                     }
                 }
             }
-            else if(hdr.pathSeq > lteControlBlock.wantedSeq){  //乱序到达的数据包
+            else if(hdr.pathSeq > wantedSeq){  //乱序到达的数据包
                 lteControlBlock.arrInOrderCounter = 0;
                 lteControlBlock.outorderQueue.put(new SplbData(hdr,msg,len));
-                // System.out.println("nak:"+hdr.pathSeq + "," + lteControlBlock.wantedSeq);
-                LTEACKTask nakTask = new LTEACKTask(lteControlBlock,hdr.pathSeq,lteControlBlock.wantedSeq,PacketType.NAKPKG,hdr.timeStamp);//对乱序数据包立即进行确认。
+                LTEACKTask nakTask = new LTEACKTask(lteControlBlock,hdr.pathSeq,wantedSeq,PacketType.NAKPKG,hdr.timeStamp);//对乱序数据包立即进行确认。
                 lteControlBlock.lteAckExecutor.execute(nakTask);
             }
         }else if(hdr.type == PacketType.RETRANS){  //每个重传数据包都需要进行确认
-            if(hdr.pathSeq < lteControlBlock.wantedSeq){ //这个不需要确认
+            int wantedSeq = lteControlBlock.wantedSeq.get();
+            if(hdr.pathSeq < wantedSeq){ //这个不需要确认
                 return;
-            }else if(hdr.pathSeq == lteControlBlock.wantedSeq){   //按序到达的数据包
+            }else if(hdr.pathSeq == wantedSeq){   //按序到达的数据包
                 lteControlBlock.inorderQueue.put(new SplbData(hdr,msg,len));
-                lteControlBlock.wantedSeq++;
-                LTEACKTask ackTask = new LTEACKTask(lteControlBlock,hdr.pathSeq,lteControlBlock.wantedSeq,PacketType.ACKPKG,hdr.timeStamp);
+                wantedSeq = lteControlBlock.wantedSeq.incrementAndGet();
+                LTEACKTask ackTask = new LTEACKTask(lteControlBlock,hdr.pathSeq,wantedSeq,PacketType.ACKPKG,hdr.timeStamp);
                 lteControlBlock.lteAckExecutor.execute(ackTask);
                 while(lteControlBlock.outorderQueue.size() > 0){    //检查是否可以从无序队列迁移出来
-                    if(lteControlBlock.outorderQueue.peek().hdr.pathSeq < lteControlBlock.wantedSeq){
+                    if(lteControlBlock.outorderQueue.peek().hdr.pathSeq < wantedSeq){
                         lteControlBlock.outorderQueue.poll();
-                    } else if(lteControlBlock.outorderQueue.peek().hdr.pathSeq == lteControlBlock.wantedSeq){
+                    } else if(lteControlBlock.outorderQueue.peek().hdr.pathSeq == wantedSeq){
                         SplbData fData = lteControlBlock.outorderQueue.poll();
-                        if(fData.hdr.pathSeq == lteControlBlock.wantedSeq){
+                        if(fData.hdr.pathSeq == wantedSeq){
                             lteControlBlock.inorderQueue.put(fData);
-                            lteControlBlock.wantedSeq++;
+                            wantedSeq = lteControlBlock.wantedSeq.incrementAndGet();
                         }
                     }else{
                         break;
                     }
                 }
             }else{
-                LTEACKTask nakTask = new LTEACKTask(lteControlBlock,hdr.pathSeq,lteControlBlock.wantedSeq,PacketType.NAKPKG,hdr.timeStamp);
+                LTEACKTask nakTask = new LTEACKTask(lteControlBlock,hdr.pathSeq,wantedSeq,PacketType.NAKPKG,hdr.timeStamp);
                 lteControlBlock.lteAckExecutor.execute(nakTask);
                 lteControlBlock.outorderQueue.put(new SplbData(hdr,msg,len));
             }
         }else if(hdr.type == PacketType.FIN){
-            if(hdr.pathSeq == lteControlBlock.wantedSeq){   //按序到达的数据包
-                LTEACKTask ackTask = new LTEACKTask(lteControlBlock,hdr.pathSeq,lteControlBlock.wantedSeq,PacketType.FIN,hdr.timeStamp);
+            int wangedSeq = lteControlBlock.wantedSeq.get();
+            if(hdr.pathSeq == wangedSeq){   //按序到达的数据包
+                LTEACKTask ackTask = new LTEACKTask(lteControlBlock,hdr.pathSeq,wangedSeq,PacketType.FIN,hdr.timeStamp);
                 lteControlBlock.lteAckExecutor.execute(ackTask);
                 lteControlBlock.endSign = true;
-            }else if(hdr.pathSeq < lteControlBlock.wantedSeq){
-                LTEACKTask ackTask = new LTEACKTask(lteControlBlock,hdr.pathSeq,lteControlBlock.wantedSeq,PacketType.NAKPKG,hdr.timeStamp);
+            }else if(hdr.pathSeq < wangedSeq){
+                LTEACKTask ackTask = new LTEACKTask(lteControlBlock,hdr.pathSeq,wangedSeq,PacketType.NAKPKG,hdr.timeStamp);
                 lteControlBlock.lteAckExecutor.execute(ackTask);
+            }
+        }else if(hdr.type == PacketType.OPD){   //lte链路发送的wifi数据包，从当前路径回传ack，并交由wifi路径处理。
+            WiFiControlBlock wifiControlBlock = lteControlBlock.serverSock.getWifiControlBlock();
+            int wantedSeq = wifiControlBlock.wantedSeq.get();
+            LTEACKTask ackTask = new LTEACKTask(lteControlBlock,hdr.pathSeq,wantedSeq,PacketType.OPDACK,hdr.timeStamp);
+            lteControlBlock.lteAckExecutor.execute(ackTask);
+            this.hdr.type = PacketType.OPDTASK;
+            WiFiDataTask OPDTask = new WiFiDataTask(wifiControlBlock,this.hdr,this.msg,this.len);
+            wifiControlBlock.wifiDataExecutor.execute(OPDTask);
+        }else if(hdr.type == PacketType.OPDTASK){
+            int wantedSeq = lteControlBlock.wantedSeq.get();
+            if(hdr.pathSeq == wantedSeq){   //按序到达的数据包
+                lteControlBlock.inorderQueue.put(new SplbData(hdr,msg,len));
+                wantedSeq = lteControlBlock.wantedSeq.incrementAndGet();
+                while(lteControlBlock.outorderQueue.size() > 0){
+                    if(lteControlBlock.outorderQueue.peek().hdr.pathSeq < wantedSeq){  //检查是否可以从无序队列迁移出来
+                        lteControlBlock.outorderQueue.poll();
+                    } else if(lteControlBlock.outorderQueue.peek().hdr.pathSeq == wantedSeq){
+                        SplbData fData = lteControlBlock.outorderQueue.poll();
+                        if(fData.hdr.pathSeq == wantedSeq){
+                            wantedSeq = lteControlBlock.wantedSeq.incrementAndGet();
+                            lteControlBlock.inorderQueue.put(fData);
+                        }
+                    }else{
+                        break;
+                    }
+                }
+            }
+            else if(hdr.pathSeq > wantedSeq){  //乱序到达的数据包
+                lteControlBlock.outorderQueue.put(new SplbData(hdr,msg,len));
             }
         }
         if(lteControlBlock.startTime ==0 ){
@@ -301,26 +348,21 @@ class LTETask implements Runnable {
                     LTEProbeTask probeTask = new LTEProbeTask(lteControlBlock,hdr);
                     lteControlBlock.lteProbeExecutor.execute(probeTask);
                 }else{
-                    //  System.out.println(hdr.type + ","+hdr.dataSeq + ":" + msg[22] + ":"+ msg[len-1]);
-                    lteControlBlock.nowRecv += 1;
-                    lteControlBlock.recvCounter += 1;
+                    if(hdr.type != PacketType.FIN){
+                        lteControlBlock.nowRecv += 1;
+                        lteControlBlock.recvCounter += 1;
+                    }
                     if(lteControlBlock.recvCounter == 1){
                         lteControlBlock.recvCounterTS = ts;
                     } else if(lteControlBlock.recvCounter==200){
                         lteControlBlock.recvCounter=0;
                         int inteval = (int)((ts - lteControlBlock.recvCounterTS)/1000);
                         int gap = inteval/200;
-                        if(lteControlBlock.sgap ==0 ){
-                            lteControlBlock.sgap = gap;
-                        }else{
-                            lteControlBlock.sgap = (int) (lteControlBlock.sgap* 0.8 + gap*0.2);
-                        }
-                        // System.out.println("gap:"+gap+",sagp:"+ lteControlBlock.sgap);
+                        lteControlBlock.gap = gap;
                     }
                     LTEDataTask dataTask = new LTEDataTask(lteControlBlock,hdr,msg,len);
                     lteControlBlock.lteDataExecutor.execute(dataTask);
                 }
-
             } catch (IOException e) {
                 e.printStackTrace();
             }
@@ -329,15 +371,15 @@ class LTETask implements Runnable {
 }
 
 class WiFiControlBlock {
-    public DatagramSocket socket = null;
+    public ServerSock serverSock;
+    public DatagramSocket socket;
     InetAddress dstIP = null;
     public int dstPort = 0;
     public int recvBytes = 0;
     public int nowRecv = 0;
-    public long nowTime = 0;
-    public int sgap = 0;
+    public int gap = 0;
     public boolean endSign = false;
-    public int wantedSeq = 1;
+    public AtomicInteger wantedSeq = new AtomicInteger(1);
     public int arrInOrderCounter = 0;
     public int ackThres = 3;
     public long startTime = 0;
@@ -345,13 +387,22 @@ class WiFiControlBlock {
     public long recvCounterTS = 0;
     public PriorityBlockingQueue<SplbData> inorderQueue;
     public PriorityBlockingQueue<SplbData> outorderQueue;
-    public ExecutorService wifiProbeExecutor = null;
-    public ExecutorService wifiDataExecutor = null;
-    public ExecutorService wifiAckExecutor = null;
+    public ExecutorService wifiProbeExecutor;
+    public ExecutorService wifiDataExecutor;
+    public ExecutorService wifiAckExecutor;
     WiFiControlBlock(DatagramSocket socket){
         this.socket = socket;
-        this.inorderQueue = new PriorityBlockingQueue<SplbData>();
-        this.outorderQueue = new PriorityBlockingQueue<SplbData>();
+        this.inorderQueue = new PriorityBlockingQueue<>();
+        this.outorderQueue = new PriorityBlockingQueue<>();
+        this.wifiProbeExecutor = Executors.newSingleThreadExecutor();
+        this.wifiDataExecutor = Executors.newSingleThreadExecutor();
+        this.wifiAckExecutor = Executors.newSingleThreadExecutor();
+    }
+    WiFiControlBlock(DatagramSocket socket,ServerSock serverSock){
+        this.socket = socket;
+        this.serverSock = serverSock;
+        this.inorderQueue = new PriorityBlockingQueue<>();
+        this.outorderQueue = new PriorityBlockingQueue<>();
         this.wifiProbeExecutor = Executors.newSingleThreadExecutor();
         this.wifiDataExecutor = Executors.newSingleThreadExecutor();
         this.wifiAckExecutor = Executors.newSingleThreadExecutor();
@@ -359,7 +410,7 @@ class WiFiControlBlock {
 }
 class WiFiProbeTask implements Runnable{
 
-    WiFiControlBlock wifiControlBlock = null;
+    WiFiControlBlock wifiControlBlock;
     SplbHdr hdr;
     WiFiProbeTask(WiFiControlBlock wifiControlBlock,SplbHdr hdr){
         this.wifiControlBlock = wifiControlBlock;
@@ -368,7 +419,7 @@ class WiFiProbeTask implements Runnable{
     @Override
     public void run() {
         try {
-            hdr.dataSeq = wifiControlBlock.sgap;
+            hdr.dataSeq = wifiControlBlock.gap;
             byte[] probe = hdr.toByteArray();
             DatagramPacket packet = new DatagramPacket(probe,probe.length,wifiControlBlock.dstIP,wifiControlBlock.dstPort);
             wifiControlBlock.socket.send(packet);
@@ -378,9 +429,9 @@ class WiFiProbeTask implements Runnable{
     }
 }
 class WiFiACKTask implements Runnable{
-    WiFiControlBlock wifiControlBlock = null;
-    int ackSeq = 0;
-    int wantedSeq = 0;
+    WiFiControlBlock wifiControlBlock;
+    int ackSeq;
+    int wantedSeq;
     PacketType type;
     long timeStamp;
     WiFiACKTask(WiFiControlBlock wifiControlBlock,int ackSeq,int wantedSeq,PacketType type,long timeStamp){
@@ -396,8 +447,10 @@ class WiFiACKTask implements Runnable{
         SplbHdr ackHdr;
         if(this.type == PacketType.ACKPKG){
             ackHdr = new SplbHdr(PacketType.ACKPKG, (byte) 1, 0, this.ackSeq, this.wantedSeq);
-        }else{
+        }else if(this.type == PacketType.NAKPKG){
             ackHdr = new SplbHdr(PacketType.NAKPKG, (byte) 1, 0, this.ackSeq,this.wantedSeq);
+        }else{
+            ackHdr = new SplbHdr(PacketType.OPDACK, (byte) 0, 0, this.ackSeq, this.wantedSeq);
         }
         ackHdr.timeStamp = timeStamp;
         byte[] ackMsg = ackHdr.toByteArray();
@@ -411,8 +464,8 @@ class WiFiACKTask implements Runnable{
 }
 class WiFiDataTask implements Runnable{
 
-    WiFiControlBlock wifiControlBlock = null;
-    SplbHdr hdr = null;
+    WiFiControlBlock wifiControlBlock;
+    SplbHdr hdr;
     byte[] msg;
     int len;
     WiFiDataTask(WiFiControlBlock wifiControlBlock,SplbHdr hdr,byte[] msg,int len){
@@ -423,26 +476,28 @@ class WiFiDataTask implements Runnable{
     }
     @Override
     public void run() {
-        wifiControlBlock.recvBytes += msg.length;
+        if(hdr.type != PacketType.FIN && hdr.type != PacketType.OPDTASK){
+            wifiControlBlock.recvBytes += msg.length;
+        }
         if(hdr.type == PacketType.DATAPKG){
-            if(hdr.pathSeq == wifiControlBlock.wantedSeq){   //按序到达的数据包
+            int wantedSeq = wifiControlBlock.wantedSeq.get();
+            if(hdr.pathSeq == wantedSeq){   //按序到达的数据包
                 wifiControlBlock.inorderQueue.put(new SplbData(hdr,msg,len));
                 wifiControlBlock.arrInOrderCounter++;
-                wifiControlBlock.wantedSeq++;
+                wantedSeq = wifiControlBlock.wantedSeq.incrementAndGet();
                 if(wifiControlBlock.arrInOrderCounter == wifiControlBlock.ackThres){
                     wifiControlBlock.arrInOrderCounter = 0;
-                  //  System.out.println("ack:"+hdr.pathSeq + "," + wifiControlBlock.wantedSeq);
-                    WiFiACKTask ackTask = new WiFiACKTask(wifiControlBlock,hdr.pathSeq,wifiControlBlock.wantedSeq,PacketType.ACKPKG,hdr.timeStamp);
+                    WiFiACKTask ackTask = new WiFiACKTask(wifiControlBlock,hdr.pathSeq,wantedSeq,PacketType.ACKPKG,hdr.timeStamp);
                     wifiControlBlock.wifiAckExecutor.execute(ackTask);
                 }
 
                 while(wifiControlBlock.outorderQueue.size() > 0){
-                    if(wifiControlBlock.outorderQueue.peek().hdr.pathSeq < wifiControlBlock.wantedSeq){  //检查是否可以从无序队列迁移出来
+                    if(wifiControlBlock.outorderQueue.peek().hdr.pathSeq < wantedSeq){  //检查是否可以从无序队列迁移出来
                         wifiControlBlock.outorderQueue.poll();
-                    } else if(wifiControlBlock.outorderQueue.peek().hdr.pathSeq == wifiControlBlock.wantedSeq){
+                    } else if(wifiControlBlock.outorderQueue.peek().hdr.pathSeq == wantedSeq){
                         SplbData fData = wifiControlBlock.outorderQueue.poll();
-                        if(fData.hdr.pathSeq == wifiControlBlock.wantedSeq){
-                            wifiControlBlock.wantedSeq++;
+                        if(fData.hdr.pathSeq == wantedSeq){
+                            wantedSeq = wifiControlBlock.wantedSeq.incrementAndGet();
                             wifiControlBlock.inorderQueue.put(fData);
                         }
                     }else{
@@ -450,47 +505,79 @@ class WiFiDataTask implements Runnable{
                     }
                 }
             }
-            else if(hdr.pathSeq > wifiControlBlock.wantedSeq){  //乱序到达的数据包
+            else if(hdr.pathSeq > wantedSeq){  //乱序到达的数据包
                 wifiControlBlock.arrInOrderCounter = 0;
                 wifiControlBlock.outorderQueue.put(new SplbData(hdr,msg,len));
-               // System.out.println("nak:"+hdr.pathSeq + "," + wifiControlBlock.wantedSeq);
-                WiFiACKTask nakTask = new WiFiACKTask(wifiControlBlock,hdr.pathSeq,wifiControlBlock.wantedSeq,PacketType.NAKPKG,hdr.timeStamp);//对乱序数据包立即进行确认。
+                WiFiACKTask nakTask = new WiFiACKTask(wifiControlBlock,hdr.pathSeq,wantedSeq,PacketType.NAKPKG,hdr.timeStamp);//对乱序数据包立即进行确认。
                 wifiControlBlock.wifiAckExecutor.execute(nakTask);
             }
         }else if(hdr.type == PacketType.RETRANS){  //每个重传数据包都需要进行确认
-            if(hdr.pathSeq < wifiControlBlock.wantedSeq){ //这个不需要确认
+            int wantedSeq = wifiControlBlock.wantedSeq.get();
+            if(hdr.pathSeq < wantedSeq){ //这个不需要确认
                 return;
-            }else if(hdr.pathSeq == wifiControlBlock.wantedSeq){   //按序到达的数据包
+            }else if(hdr.pathSeq == wantedSeq){   //按序到达的数据包
                 wifiControlBlock.inorderQueue.put(new SplbData(hdr,msg,len));
-                wifiControlBlock.wantedSeq++;
-                WiFiACKTask ackTask = new WiFiACKTask(wifiControlBlock,hdr.pathSeq,wifiControlBlock.wantedSeq,PacketType.ACKPKG,hdr.timeStamp);
+                wantedSeq = wifiControlBlock.wantedSeq.incrementAndGet();
+                WiFiACKTask ackTask = new WiFiACKTask(wifiControlBlock,hdr.pathSeq,wantedSeq,PacketType.ACKPKG,hdr.timeStamp);
                 wifiControlBlock.wifiAckExecutor.execute(ackTask);
                 while(wifiControlBlock.outorderQueue.size() > 0){    //检查是否可以从无序队列迁移出来
-                    if(wifiControlBlock.outorderQueue.peek().hdr.pathSeq < wifiControlBlock.wantedSeq){
+                    if(wifiControlBlock.outorderQueue.peek().hdr.pathSeq < wantedSeq){
                         wifiControlBlock.outorderQueue.poll();
-                    } else if(wifiControlBlock.outorderQueue.peek().hdr.pathSeq == wifiControlBlock.wantedSeq){
+                    } else if(wifiControlBlock.outorderQueue.peek().hdr.pathSeq == wantedSeq){
                         SplbData fData = wifiControlBlock.outorderQueue.poll();
-                        if(fData.hdr.pathSeq == wifiControlBlock.wantedSeq){
+                        if(fData.hdr.pathSeq == wantedSeq){
                             wifiControlBlock.inorderQueue.put(fData);
-                            wifiControlBlock.wantedSeq++;
+                            wantedSeq = wifiControlBlock.wantedSeq.incrementAndGet();
                         }
                     }else{
                         break;
                     }
                 }
             }else{
-                WiFiACKTask nakTask = new WiFiACKTask(wifiControlBlock,hdr.pathSeq,wifiControlBlock.wantedSeq,PacketType.NAKPKG,hdr.timeStamp);
+                WiFiACKTask nakTask = new WiFiACKTask(wifiControlBlock,hdr.pathSeq,wantedSeq,PacketType.NAKPKG,hdr.timeStamp);
                 wifiControlBlock.wifiAckExecutor.execute(nakTask);
                 wifiControlBlock.outorderQueue.put(new SplbData(hdr,msg,len));
             }
         }else if(hdr.type == PacketType.FIN){
-            if(hdr.pathSeq == wifiControlBlock.wantedSeq){   //按序到达的数据包
-                WiFiACKTask ackTask = new WiFiACKTask(wifiControlBlock,hdr.pathSeq,wifiControlBlock.wantedSeq,PacketType.FIN,hdr.timeStamp);
+            int wantedSeq = wifiControlBlock.wantedSeq.get();
+            if(hdr.pathSeq == wantedSeq){   //按序到达的数据包
+                WiFiACKTask ackTask = new WiFiACKTask(wifiControlBlock,hdr.pathSeq,wantedSeq,PacketType.FIN,hdr.timeStamp);
                 wifiControlBlock.wifiAckExecutor.execute(ackTask);
                 wifiControlBlock.endSign = true;
-            }else if(hdr.pathSeq < wifiControlBlock.wantedSeq){
-                WiFiACKTask ackTask = new WiFiACKTask(wifiControlBlock,hdr.pathSeq,wifiControlBlock.wantedSeq,PacketType.NAKPKG,hdr.timeStamp);
+            }else if(hdr.pathSeq < wantedSeq){
+                WiFiACKTask ackTask = new WiFiACKTask(wifiControlBlock,hdr.pathSeq,wantedSeq,PacketType.NAKPKG,hdr.timeStamp);
                 wifiControlBlock.wifiAckExecutor.execute(ackTask);
+            }
+        }else if(hdr.type == PacketType.OPD){
+            LTEControlBlock lteControlBlock = wifiControlBlock.serverSock.getLteControlBlock();
+            int wantedSeq = lteControlBlock.wantedSeq.get();
+            WiFiACKTask ackTask = new WiFiACKTask(wifiControlBlock,hdr.pathSeq,wantedSeq,PacketType.OPDACK,hdr.timeStamp);
+            wifiControlBlock.wifiAckExecutor.execute(ackTask);
+            hdr.type = PacketType.OPDTASK;
+            LTEDataTask OPDTask = new LTEDataTask(lteControlBlock,this.hdr,this.msg,this.len);
+            lteControlBlock.lteDataExecutor.execute(OPDTask);
+        }else if(hdr.type == PacketType.OPDTASK){//从其他路径接受的数据，交由当前路径处理。
+            int wantedSeq = wifiControlBlock.wantedSeq.get();
+            //System.out.println("wifi opd" + hdr.pathSeq  + "," + wantedSeq + ", oqsize:" + wifiControlBlock.outorderQueue.size());
+            if(hdr.pathSeq == wantedSeq){   //按序到达的数据包
+                wifiControlBlock.inorderQueue.put(new SplbData(hdr,msg,len));
+                wantedSeq = wifiControlBlock.wantedSeq.incrementAndGet();
+                while(wifiControlBlock.outorderQueue.size() > 0){
+                    if(wifiControlBlock.outorderQueue.peek().hdr.pathSeq < wantedSeq){  //检查是否可以从无序队列迁移出来
+                        wifiControlBlock.outorderQueue.poll();
+                    } else if(wifiControlBlock.outorderQueue.peek().hdr.pathSeq == wantedSeq){
+                        SplbData fData = wifiControlBlock.outorderQueue.poll();
+                        if(fData.hdr.pathSeq == wantedSeq){
+                            wantedSeq = wifiControlBlock.wantedSeq.incrementAndGet();
+                            wifiControlBlock.inorderQueue.put(fData);
+                        }
+                    }else{
+                        break;
+                    }
+                }
+            }
+            else if(hdr.pathSeq > wantedSeq){  //乱序到达的数据包
+                wifiControlBlock.outorderQueue.put(new SplbData(hdr,msg,len));
             }
         }
         if(wifiControlBlock.startTime ==0 ){
@@ -526,7 +613,6 @@ class WiFiTask implements Runnable {
                     WiFiProbeTask probeTask = new WiFiProbeTask(wifiControlBlock,hdr);
                     wifiControlBlock.wifiProbeExecutor.execute(probeTask);
                 }else{
-                  //  System.out.println(hdr.type + ","+hdr.dataSeq + ":" + msg[22] + ":"+ msg[len-1]);
                     if(hdr.type != PacketType.FIN){
                         wifiControlBlock.nowRecv += 1;
                         wifiControlBlock.recvCounter += 1;
@@ -537,12 +623,7 @@ class WiFiTask implements Runnable {
                         wifiControlBlock.recvCounter=0;
                         int inteval = (int)((ts - wifiControlBlock.recvCounterTS)/1000);
                         int gap = inteval/200;
-                        if(wifiControlBlock.sgap ==0 ){
-                            wifiControlBlock.sgap = gap;
-                        }else{
-                            wifiControlBlock.sgap = (int) (wifiControlBlock.sgap* 0.8 + gap*0.2);
-                        }
-                       // System.out.println("gap:"+gap+",sagp:"+ wifiControlBlock.sgap);
+                        wifiControlBlock.gap = gap;
                     }
                     WiFiDataTask dataTask = new WiFiDataTask(wifiControlBlock,hdr,msg,len);
                     wifiControlBlock.wifiDataExecutor.execute(dataTask);
@@ -587,8 +668,8 @@ class SpeedTask implements Runnable{
                     lteLastRecv = lteControlBlock.recvBytes;
                     double wifiBW =(wifiRecv * 8.0) / interval;
                     double lteBW = (lteRecv * 8.0) / interval;
-                    int wseq = wifiControlBlock.wantedSeq;
-                    int lseq = lteControlBlock.wantedSeq;
+                    int wseq = wifiControlBlock.wantedSeq.get();
+                    int lseq = lteControlBlock.wantedSeq.get();
                     String speed = lteBW+"-"+wifiBW;
                     byte[] data = speed.getBytes();
                     int len = data.length;
@@ -623,7 +704,7 @@ class APPTask implements Runnable{
         int wantedSeq = 1;
         PriorityBlockingQueue<SplbData> wq= wifiControlBlock.inorderQueue;
         PriorityBlockingQueue<SplbData> lq = lteControlBlock.inorderQueue;
-        File file = new File("/home/test.mkv");
+        File file = new File("/home/test.mp4");
         FileOutputStream os = null;
         try {
             os = new FileOutputStream(file);
@@ -639,7 +720,6 @@ class APPTask implements Runnable{
                 }else if(wq.peek().hdr.dataSeq == wantedSeq){
                     SplbData poll = wq.poll();
                     try {
-                        //System.out.println(wantedSeq + ","+poll.hdr.dataSeq + ":" + poll.data[22] + ":"+ poll.data[poll.len-1]);
                         os.write(poll.data,22,poll.len-22);
                         os.flush();
 
@@ -656,7 +736,6 @@ class APPTask implements Runnable{
                     SplbData poll = lq.poll();
                     try {
                         os.write(poll.data,22,poll.len-22);
-                        //System.out.println(wantedSeq + ","+poll.hdr.dataSeq + ":" + poll.data[22] + ":"+ poll.data[poll.len-1]);
                         os.flush();
                     } catch (IOException e) {
                         e.printStackTrace();
@@ -669,22 +748,33 @@ class APPTask implements Runnable{
 }
 class ServerSock {
     public int port = 18000;
-    public DatagramSocket lteSocket;
-    public DatagramSocket wifiSocket;
-    public Thread lteRecvThread = null;
-    public Thread wifiRecvThread = null;
-    public Thread consumeDataThread = null;
-    public Thread speedThread = null;
+    private LTEControlBlock lteControlBlock;
+    private WiFiControlBlock wifiControlBlock;
+    private Thread lteRecvThread = null;
+    private Thread wifiRecvThread = null;
+    private Thread consumeDataThread = null;
+    private Thread speedThread = null;
+
+    ServerSock(){
+
+    }
+
+    ServerSock(int port){
+        this.port = port;
+    }
+
     public void init(){
+        DatagramSocket lteSocket = null;
+        DatagramSocket wifiSocket = null;
         try {
-            this.lteSocket = new DatagramSocket(this.port);
-            this.wifiSocket = new DatagramSocket(this.port+1);
+            lteSocket = new DatagramSocket(this.port);
+            wifiSocket = new DatagramSocket(this.port+1);
 
         } catch (SocketException e) {
             e.printStackTrace();
         }
-        LTEControlBlock lteControlBlock = new LTEControlBlock(lteSocket);
-        WiFiControlBlock wifiControlBlock = new WiFiControlBlock(wifiSocket);
+        this.lteControlBlock = new LTEControlBlock(lteSocket,this);
+        this.wifiControlBlock = new WiFiControlBlock(wifiSocket,this);
         LTETask lteTask = new LTETask(lteControlBlock);
         WiFiTask wifiTask = new WiFiTask(wifiControlBlock);
         this.lteRecvThread = new Thread(lteTask);
@@ -692,12 +782,21 @@ class ServerSock {
         this.speedThread = new Thread(new SpeedTask(wifiControlBlock,lteControlBlock));
         this.consumeDataThread = new Thread(new APPTask(wifiControlBlock,lteControlBlock));
     }
+
     public void run(){
         this.init();
         this.speedThread.start();
         this.lteRecvThread.start();
         this.wifiRecvThread.start();
         this.consumeDataThread.start();
+    }
+
+    protected LTEControlBlock getLteControlBlock(){
+        return this.lteControlBlock;
+    }
+
+    protected WiFiControlBlock getWifiControlBlock(){
+        return this.wifiControlBlock;
     }
 }
 public class Server{
