@@ -1,7 +1,6 @@
-import java.io.IOException;
-import java.net.DatagramPacket;
-import java.net.DatagramSocket;
-import java.net.SocketException;
+import java.io.*;
+import java.net.*;
+import java.util.Date;
 import java.util.concurrent.TimeUnit;
 
 public class UDPServer {
@@ -13,8 +12,15 @@ public class UDPServer {
             new Thread(new Runnable() {
                 @Override
                 public void run() {
+                    File file = new File("/home/test.mp4");
+                    FileOutputStream os = null;
+                    try {
+                        os = new FileOutputStream(file);
+                    } catch (FileNotFoundException e) {
+                        e.printStackTrace();
+                    }
                     while(true){
-                        byte[] data = new byte[534];
+                        byte[] data = new byte[512];
                         DatagramPacket packet = new DatagramPacket(data,data.length);
                         try {
                             wifiSocket.receive(packet);
@@ -22,6 +28,7 @@ public class UDPServer {
                             int len = packet.getLength();
                             if(len > 0){
                                 recvbytes += len;
+                                os.write(msg,0,len);
                             }
 
                         } catch (IOException e) {
@@ -33,6 +40,15 @@ public class UDPServer {
             new Thread(new Runnable() {
                 @Override
                 public void run() {
+                    InetAddress address = null;
+                    int dstport = 15000;
+                    DatagramSocket speedSocket = null;
+                    try {
+                        address = InetAddress.getByName("127.0.0.1");
+                        speedSocket = new DatagramSocket(12345);
+                    } catch (UnknownHostException|SocketException e) {
+                        e.printStackTrace();
+                    }
                     int wifiLastRecv = 0;
                     long lastTime = 0;
                     try {
@@ -47,12 +63,15 @@ public class UDPServer {
                                 int wifiRecv = UDPServer.recvbytes - wifiLastRecv;
                                 wifiLastRecv = UDPServer.recvbytes;
                                 double wifiBW =(wifiRecv * 8.0) / interval;
-                                // System.out.println("--------------------------");
-                                System.out.println(wifiBW);
+                                String speed = "0:"+wifiBW;
+                                byte[] data = speed.getBytes();
+                                int len = data.length;
+                                DatagramPacket packet = new DatagramPacket(data,len,address,dstport);
+                                speedSocket.send(packet);
                                 TimeUnit.SECONDS.sleep(1);
                             }
                         }
-                    }catch (InterruptedException e) {
+                    }catch (InterruptedException | IOException e) {
                         e.printStackTrace();
                     }
                 }
